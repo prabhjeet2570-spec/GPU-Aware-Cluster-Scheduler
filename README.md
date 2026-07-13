@@ -58,7 +58,7 @@ Does the opposite: puts jobs on the emptiest nodes first. When a job needs multi
 
 #### `gang.py` — Gang Scheduler
 
-Requires all GPUs for a job to be on the **same node** and **contiguous** (next to each other). This is how some real GPU schedulers work (like SLURM's gang scheduling). It avoids cross-node communication overhead but can reject jobs that would fit if spread across nodes.
+Requires all GPUs for a job to be on the **same node** and **contiguous** (next to each other). This models a stricter placement constraint some production schedulers use, requiring co-located, contiguous GPUs to minimize inter-GPU communication overhead for distributed training jobs. It can reject jobs that would fit if spread across nodes.
 
 ### `simulate.py` — Command-line entry point
 
@@ -118,12 +118,42 @@ The core simulation requires **no external packages**. Just Python 3.10+. For ch
 pip install matplotlib
 ```
 
+## Results
+
+Benchmarked 1000 jobs across 10 random seeds on a 5-node, 8-GPU-per-node cluster (40 GPUs total). All numbers are mean ± 1 standard deviation. Results are consistent at both 500 and 1000 jobs; the 1000-job run is shown for tighter variance.
+
+![Benchmark comparison chart](benchmark_comparison.png)
+
+| Metric | Naive | BinPack | Spread | Gang |
+|--------|-------|---------|--------|------|
+| Avg wait time (ticks) | 2469.4 ± 70.2 | 2469.4 ± 70.2 | 2469.4 ± 70.2 | 2350.8 ± 95.1 |
+| Avg fragmentation | 1.17% ± 0.42% | 0.93% ± 0.18% | 2.27% ± 0.54% | 37.31% ± 4.29% |
+| Node util std dev | 0.013 ± 0.003 | 0.012 ± 0.002 | 0.009 ± 0.002 | 0.087 ± 0.007 |
+| Cross-node jobs | 688 ± 42 | 636 ± 42 | 865 ± 17 | 0 ± 0 |
+| Jobs / tick | 0.1657 ± 0.0049 | 0.1657 ± 0.0049 | 0.1657 ± 0.0049 | 0.1502 ± 0.0039 |
+| Jobs completed | 1000 ± 0 | 1000 ± 0 | 1000 ± 0 | 1000 ± 0 |
+
+**BinPack** produces the lowest fragmentation (0.93%) by packing jobs onto the fullest nodes first, and minimizes cross-node splitting (636 vs 688 for Naive). **Spread** creates the most cross-node jobs (865) by placing one GPU per node in round-robin, which raises fragmentation (2.27%) but gives the best load balance (node utilization std dev of 0.009 vs 0.013). **Gang** avoids cross-node placements entirely (0 cross-node jobs) but pays for it with high fragmentation (~37%) and slightly lower throughput (0.1502 vs 0.1657 jobs/tick). Wait times and completion counts are nearly identical across Naive, BinPack, and Spread since none of them refuse placements — when the cluster has enough capacity, any cross-node strategy works equally well for these metrics.
+
+**Preemption** (500 jobs, 10 seeds, same cluster) was benchmarked separately. Its effects are most visible on Gang: fragmentation drops from 39.40% to 20.33% because high-priority jobs can carve out contiguous space by displacing lower-priority work. Naive, BinPack, and Spread see minimal change — their cross-node flexibility already handles contention without preemption. Wait times increase slightly across all schedulers (e.g., Naive from 1176.9 to 1297.2 ticks) since preempted jobs are re-queued and eventually complete, extending their total time in the system.
+
+## Methodology and Limitations
+
+- **Relative comparison, not production numbers.** These results compare algorithms against each other under identical simulated conditions. They are not benchmarks of real-world scheduler performance.
+- **Cluster sizing matters.** With small clusters (e.g., 3 nodes x 4 GPUs) where job GPU requirements approach node capacity, scheduler choice has little effect on placement quality — large jobs are forced cross-node regardless of strategy. Meaningful comparison requires node capacity large enough that most jobs can fit on a single node.
+- **What the simulation does not model:** real hardware failures, heterogeneous GPU types (e.g., A100 vs H100), network cost between nodes, multi-tenant fairness policies, real driver or scheduler overhead, or energy consumption.
+- **Statistical validity.** All comparisons are aggregated across 10 random seeds with reported variance, not single runs. Results are reproducible using the fixed-seed `JobGenerator`.
+
 ## How to reproduce results
 
 ### One-shot simulation
 
 ```bash
 # Default: naive scheduler, 500 jobs, 3 nodes x 4 GPUs
+# Note: the small default cluster (3 nodes x 4 GPUs) is useful for quick
+# sanity checks but is too tight relative to job sizes to show meaningful
+# differences between scheduling strategies. Use --nodes 5 --gpus-per-node 8
+# (the benchmark default) for representative comparisons.
 python simulate.py
 
 # Try different schedulers
@@ -131,7 +161,7 @@ python simulate.py --scheduler bin-pack
 python simulate.py --scheduler spread
 python simulate.py --scheduler gang
 
-# Adjust cluster size and workload
+# Representative cluster size
 python simulate.py --scheduler gang --nodes 5 --gpus-per-node 8 --jobs 1000
 
 # Enable preemption
@@ -166,4 +196,4 @@ python benchmark.py --no-charts
 python test_scheduler.py
 ```
 
-All 24 tests should pass with output like `24/24 passed`.
+All 24 tests should pass with output like `24/24 passed`. Tests cover: cluster allocation and deallocation logic, fragmentation and utilization calculations, correctness of each scheduler's placement decisions on hand-constructed cases, and gang scheduling's contiguous-block requirement.
